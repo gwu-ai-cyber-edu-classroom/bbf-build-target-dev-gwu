@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="card">
+    <h1>Upload a file</h1>
+    <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+      <label>
+        File <span class="hint">(max {{ max_mb }} MB)</span>
+        <input type="file" name="file" required>
+      </label>
+      <label>
+        Visibility
+        <select name="visibility">
+          <option value="public">Public — anyone with the link</option>
+          <option value="private">Private — needs the owner token</option>
+        </select>
+      </label>
+      <button type="submit">Upload</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Recent public files</h2>
+    {% if files %}
+      <ul class="files">
+        {% for f in files %}
+          <li>
+            <a href="{{ url_for('view_file', file_id=f['id']) }}">{{ f['name'] }}</a>
+            <span class="meta">{{ f['kind'] }} · {{ f['size'] }} bytes · {{ f['created_at'] }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="muted">No public files yet — upload one above.</p>
+    {% endif %}
+  </section>
+{% endblock %}

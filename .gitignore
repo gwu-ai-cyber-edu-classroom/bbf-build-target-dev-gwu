@@ -1,0 +1,8 @@
+# Runtime data — holds the seeded canary in SQLite; must never be committed.
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

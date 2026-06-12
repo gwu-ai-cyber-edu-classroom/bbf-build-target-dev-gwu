@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ file['name'] }} — preview{% endblock %}
+{% block content %}
+  {# raw_url carries the token through for private files so preview/download works #}
+  {% set raw_url = url_for('raw_file', file_id=file['id'], token=token) if token
+                   else url_for('raw_file', file_id=file['id']) %}
+  <section class="card">
+    <h1>{{ file['name'] }}</h1>
+    <p class="meta">
+      {{ file['kind'] }} · {{ file['size'] }} bytes · {{ file['created_at'] }}
+      · {{ file['visibility'] }}
+    </p>
+
+    {% if file['kind'] == 'text' %}
+      {# preview_text is auto-escaped by Jinja, so uploaded markup is inert (P5). #}
+      <pre class="preview">{{ preview_text }}</pre>
+    {% elif file['kind'] == 'image' %}
+      <img class="preview" src="{{ raw_url }}" alt="{{ file['name'] }}">
+    {% else %}
+      <p class="muted">No inline preview for this file type.</p>
+    {% endif %}
+
+    <p class="actions">
+      <a href="{{ raw_url }}">Open raw / download</a>
+    </p>
+  </section>
+{% endblock %}
