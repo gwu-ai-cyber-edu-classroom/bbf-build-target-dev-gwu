@@ -3,6 +3,7 @@
   <section class="card">
     <h1>Upload a file</h1>
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <label>
         File <span class="hint">(max {{ max_mb }} MB)</span>
         <input type="file" name="file" required>

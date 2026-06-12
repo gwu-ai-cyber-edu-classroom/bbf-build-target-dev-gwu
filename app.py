@@ -33,6 +33,7 @@ Run:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -48,6 +49,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    session,
     url_for,
 )
 
@@ -61,6 +63,7 @@ SECRET_DIR = ROOT / "secret"
 
 MAX_CONTENT_BYTES = 2 * 1024 * 1024     # 2 MB per upload
 MAX_NAME_LEN = 200
+MAX_FILES = 1000                        # cap stored rows -> bounded disk use (P3)
 ID_BYTES = 16                           # -> 22-char unguessable url-safe id
 TOKEN_BYTES = 24
 
@@ -78,6 +81,33 @@ IMAGE_SIGNATURES = [
 app = Flask(__name__)
 # Cap the request body so oversized payloads are refused before we buffer them (P3).
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_BYTES + 64 * 1024
+# Signed-cookie session backs the CSRF synchronizer token. A fresh random key
+# each start is fine here (tokens simply don't survive a restart).
+app.config.update(
+    SECRET_KEY=secrets.token_hex(32),
+    SESSION_COOKIE_HTTPONLY=True,    # JS can't read it (and CSP blocks JS anyway)
+    SESSION_COOKIE_SAMESITE="Strict",  # cookie not sent on cross-site requests -> CSRF
+)
+
+
+class _RedactTokenFilter(logging.Filter):
+    """
+    A private file's capability token rides in the URL query string. Strip it
+    from the access log so the secret never lands in a log file (P1 defense in
+    depth) even though it is never otherwise emitted.
+    """
+
+    _pat = re.compile(r"(token=)[^&\s\"']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "token=" in msg:
+            record.msg = self._pat.sub(r"\1REDACTED", msg)
+            record.args = ()
+        return True
+
+
+logging.getLogger("werkzeug").addFilter(_RedactTokenFilter())
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +206,28 @@ def _new_id() -> str:
     return secrets.token_urlsafe(ID_BYTES)
 
 
+def _csrf_token() -> str:
+    """Issue (once per session) the CSRF synchronizer token shown in the form."""
+    tok = session.get("csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        session["csrf"] = tok
+    return tok
+
+
+def _check_csrf() -> None:
+    """
+    Reject any state-changing request whose form token does not match the one in
+    the signed session cookie. A cross-site attacker can neither read the session
+    cookie (SameSite=Strict, so it isn't even sent) nor guess the token, so a
+    forged POST always fails here (CSRF immunity).
+    """
+    sent = request.form.get("csrf_token", "")
+    real = session.get("csrf", "")
+    if not real or not sent or not secrets.compare_digest(sent, real):
+        abort(400, "Invalid or missing CSRF token. Reload the page and try again.")
+
+
 def _authorized(rec: sqlite3.Row, supplied_token: str) -> bool:
     """A private file requires a constant-time match on its owner token."""
     if rec["visibility"] != "private":
@@ -222,6 +274,18 @@ def _clean_name(raw: str) -> str:
     return base or "upload"
 
 
+def _disposition_filename(name: str) -> str:
+    """
+    A header-safe filename for Content-Disposition. WSGI/HTTP header values must
+    be latin-1 encodable, so a unicode display name (emoji, CJK, ...) would raise
+    while the response is being serialized. We collapse to ASCII and drop quote /
+    backslash chars so the header can never error out or be broken out of (P3).
+    """
+    ascii_name = name.encode("ascii", "replace").decode("ascii")
+    ascii_name = ascii_name.replace('"', "").replace("\\", "")
+    return ascii_name or "download"
+
+
 # --------------------------------------------------------------------------- #
 # Response hardening (defense in depth for P5 / XSS)
 # --------------------------------------------------------------------------- #
@@ -248,12 +312,16 @@ def index():
         " WHERE visibility = 'public' ORDER BY created_at DESC, rowid DESC LIMIT 50"
     ).fetchall()
     return render_template(
-        "index.html", files=rows, max_mb=MAX_CONTENT_BYTES // (1024 * 1024)
+        "index.html",
+        files=rows,
+        max_mb=MAX_CONTENT_BYTES // (1024 * 1024),
+        csrf_token=_csrf_token(),
     )
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    _check_csrf()  # reject forged cross-site submissions before doing any work
     uploaded = request.files.get("file")
     visibility = request.form.get("visibility", "public").strip()
 
@@ -268,6 +336,11 @@ def upload():
         abort(400, "Uploaded file is empty.")
     if len(data) > MAX_CONTENT_BYTES:
         abort(413, "File is too large.")
+
+    # Bound total storage so a flood of uploads cannot exhaust disk (P3).
+    count = get_db().execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    if count >= MAX_FILES:
+        abort(503, "Storage is full; uploads are temporarily disabled.")
 
     kind, mime = _sniff(data)                  # server-decided, client-ignored
     name = _clean_name(uploaded.filename)       # display only
@@ -309,12 +382,12 @@ def raw_file(file_id: str):
     token = request.args.get("token", "")
     if not _authorized(rec, token):
         abort(404)
-    # The displayed name is quoted into the header and never used as a path.
+    # The displayed name is sanitized into the header and never used as a path.
     disposition = "inline" if rec["kind"] in ("text", "image") else "attachment"
     headers = {
         "Content-Type": rec["mime"],
         "Content-Disposition": '%s; filename="%s"'
-        % (disposition, rec["name"].replace('"', "")),
+        % (disposition, _disposition_filename(rec["name"])),
     }
     return Response(bytes(rec["content"]), status=200, headers=headers)
 
@@ -374,6 +447,11 @@ def _h413(_e):
     return _error_response(413, "File is too large.")
 
 
+@app.errorhandler(503)
+def _h503(_e):
+    return _error_response(503, "Storage is full; uploads are temporarily disabled.")
+
+
 @app.errorhandler(405)
 def _h405(_e):
     return _error_response(405, "Method not allowed.")
@@ -395,5 +473,6 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     # debug=False so Werkzeug's interactive debugger (which would expose internals
-    # and allow code execution) is never enabled (P1 / P3 / P4).
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # and allow code execution) is never enabled (P1 / P3 / P4). threaded=True keeps
+    # one slow client from blocking everyone else (mild DoS resilience, P3).
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

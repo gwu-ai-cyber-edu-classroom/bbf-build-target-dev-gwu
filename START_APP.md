@@ -40,12 +40,19 @@ flask --app app run --port 8000
   unguessable owner token (capability URL), handed to the uploader once on creation.
 - **A benign request that should succeed:**
 
-  ```bash
-  # Upload a public text file, then follow the redirect to its preview:
-  echo 'hello world' > /tmp/hello.txt
-  curl -sL -F "file=@/tmp/hello.txt" -F "visibility=public" http://127.0.0.1:8000/upload
+  Uploads are CSRF-protected: grab a CSRF token + session cookie from the home
+  page first, then submit them with the upload.
 
-  # Or just list public files as JSON:
+  ```bash
+  echo 'hello world' > /tmp/hello.txt
+  # 1. fetch a CSRF token and save the session cookie
+  CSRF=$(curl -s -c /tmp/jar http://127.0.0.1:8000/ \
+         | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p')
+  # 2. upload with the cookie + token, follow the redirect to the preview
+  curl -sL -b /tmp/jar -F "file=@/tmp/hello.txt" -F "visibility=public" \
+       -F "csrf_token=$CSRF" http://127.0.0.1:8000/upload
+
+  # Listing public files needs no token (read-only):
   curl -s http://127.0.0.1:8000/api/files
   ```
 
